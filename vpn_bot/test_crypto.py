@@ -1,4 +1,4 @@
-from cryptopay import get_me, create_invoice
+from vpn_bot.cryptopay import get_me, create_invoice
 
 if __name__ == "__main__":
     print("Проверяю токен…")

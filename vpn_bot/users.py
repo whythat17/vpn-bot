@@ -1,60 +1,65 @@
-# users.py
+# vpn_bot/users.py
+from __future__ import annotations
+import json, os, tempfile
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Optional
 
-import json
-from datetime import datetime, timedelta
+BASE_DIR = os.path.dirname(__file__)
+USERS_FILE = os.path.join(BASE_DIR, "users.json")
 
-USERS_FILE = 'users.json'
-users = {}  # глобальный словарь пользователей
 
-def load_users():
-    global users
-    try:
-        with open(USERS_FILE, 'r', encoding='utf-8') as f:
-            raw_data = json.load(f)
-            for user_id, data in raw_data.items():
-                users[int(user_id)] = {
-                    "subscribed": data["subscribed"],
-                    "subscription_start": datetime.fromisoformat(data["subscription_start"]) if data["subscription_start"] else None,
-                    "subscription_end": datetime.fromisoformat(data["subscription_end"]) if data["subscription_end"] else None
-                }
-        print(f"✅ Загружено пользователей: {len(users)}")
-    except FileNotFoundError:
-        print("⚠️ Файл users.json не найден. Будет создан при первом сохранении.")
-        users = {}
+@dataclass
+class User:
+    subscribed: bool = False
+    subscription_start: Optional[str] = None  # ISO формат
+    subscription_end: Optional[str] = None    # ISO формат
 
-def save_users():
-    data = {}
-    for user_id, info in users.items():
-        data[str(user_id)] = {
-            "subscribed": info["subscribed"],
-            "subscription_start": info["subscription_start"].isoformat() if info["subscription_start"] else None,
-            "subscription_end": info["subscription_end"].isoformat() if info["subscription_end"] else None
-        }
-    with open(USERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
 
-def register_user(user_id):
-    if user_id not in users:
-        users[user_id] = {
-            "subscribed": False,
-            "subscription_start": None,
-            "subscription_end": None
-        }
-        print(f"👤 Новый пользователь зарегистрирован: {user_id}")
-        save_users()
+def _to_iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
 
-def subscribe_user(user_id, days=7):
-    now = datetime.now()
-    if user_id in users:
-        users[user_id]["subscribed"] = True
-        users[user_id]["subscription_start"] = now
-        users[user_id]["subscription_end"] = now + timedelta(days=days)
-        print(f"💳 Подписка оформлена: {user_id}, до {users[user_id]['subscription_end']}")
-        save_users()
 
-def check_subscription(user_id):
-    if user_id in users:
-        end = users[user_id]["subscription_end"]
-        if end and datetime.now() < end:
-            return True
-    return False
+def load_users() -> Dict[int, User]:
+    if not os.path.exists(USERS_FILE):
+        return {}
+    with open(USERS_FILE, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    users: Dict[int, User] = {}
+    for k, v in raw.items():
+        users[int(k)] = User(**v)
+    return users
+
+
+def save_users(users: Dict[int, User]) -> None:
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="users_", suffix=".json", dir=BASE_DIR)
+    os.close(tmp_fd)
+    data = {str(uid): asdict(u) for uid, u in users.items()}
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, USERS_FILE)
+
+
+def register_user(users: Dict[int, User], user_id: int) -> None:
+    users.setdefault(user_id, User())
+    save_users(users)
+
+
+def activate_subscription(users: Dict[int, User], user_id: int, days: int) -> None:
+    start = datetime.now(timezone.utc)
+    end = start + timedelta(days=days)
+    u = users.setdefault(user_id, User())
+    u.subscribed = True
+    u.subscription_start = _to_iso(start)
+    u.subscription_end = _to_iso(end)
+    save_users(users)
+
+
+def is_subscription_active(users: Dict[int, User], user_id: int) -> bool:
+    u = users.get(user_id)
+    if not u or not u.subscription_end:
+        return False
+    end = datetime.fromisoformat(u.subscription_end)
+    return datetime.now(timezone.utc) < end
