@@ -51,12 +51,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     register_user(USERS, user_id)
     await update.message.reply_text(
-          "👋 Привет! Я бот для доступа к VPN.\n\n"
-          "Доступные команды:\n"
-    "/buy — создать счёт на оплату\n"
-    "/check <invoice_id> — проверить оплату\n"
-    "/status — статус подписки\n"
-    "/vpn — получить VPN-конфиг (если подписка активна)"
+        "👋 Привет! Я бот для доступа к VPN.\n\n"
+        "Доступные команды:\n"
+        "/buy — создать счёт на оплату\n"
+        "/check <invoice_id> — проверить оплату\n"
+        "/status — статус подписки\n"
+        "/vpn — получить VPN-конфиг\n"
+        "/help — помощь и команды"
 )
 
 
@@ -180,6 +181,20 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Создайте новый счёт: /buy"
         )
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _throttle(update): return
+    await update.message.reply_text(
+        "ℹ️ Помощь\n\n"
+        "/buy — создать счёт на оплату\n"
+        "/check <invoice_id> — проверить оплату (active/paid/expired)\n"
+        "/status — показать статус подписки\n"
+        "/vpn — получить VPN-конфиг (если подписка активна)\n\n"
+        "DEV (только для владельца, если DEV_MODE=true):\n"
+        "/dev_paid <invoice_id> — имитация оплаты\n"
+        "/grant <days> — выдать подписку на N дней"
+    )
+
+
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Неизвестная команда. Доступные: /buy, /check, /vpn, /status")
 
@@ -228,6 +243,7 @@ def main():
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("check", check))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("vpn", vpn))
 
     # DEV handlers
