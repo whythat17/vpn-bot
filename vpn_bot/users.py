@@ -12,8 +12,11 @@ USERS_FILE = os.path.join(BASE_DIR, "users.json")
 @dataclass
 class User:
     subscribed: bool = False
-    subscription_start: Optional[str] = None  # ISO формат
-    subscription_end: Optional[str] = None    # ISO формат
+    subscription_start: Optional[str] = None  # ISO
+    subscription_end: Optional[str] = None    # ISO
+    wg_private_key: Optional[str] = None
+    wg_public_key: Optional[str] = None
+    wg_address: Optional[str] = None  # например "10.66.0.2/32"
 
 
 def _to_iso(dt: datetime) -> str:
@@ -55,6 +58,31 @@ def activate_subscription(users: Dict[int, User], user_id: int, days: int) -> No
     u.subscription_start = _to_iso(start)
     u.subscription_end = _to_iso(end)
     save_users(users)
+
+def assigned_wg_addresses(users: Dict[int, User]) -> set[str]:
+    return {u.wg_address for u in users.values() if getattr(u, "wg_address", None)}
+
+def next_wg_address(users: Dict[int, User], prefix: str, cidr: int, start_host: int = 2) -> str:
+    """
+    Ищет свободный адрес в подсети prefix.X/cidr, начиная с start_host.
+    Пример: prefix="10.66.0", cidr=32 -> 10.66.0.2/32, 10.66.0.3/32, ...
+    """
+    used = assigned_wg_addresses(users)
+    host = start_host
+    while host < 255:  # простой линейный перебор
+        candidate = f"{prefix}.{host}/{cidr}"
+        if candidate not in used:
+            return candidate
+        host += 1
+    raise RuntimeError("Не осталось свободных WG адресов в пуле")
+
+def set_wg_profile(users: Dict[int, User], user_id: int, priv: str, pub: str, addr: str) -> None:
+    u = users.setdefault(user_id, User())
+    u.wg_private_key = priv
+    u.wg_public_key = pub
+    u.wg_address = addr
+    save_users(users)
+
 
 
 def is_subscription_active(users: Dict[int, User], user_id: int) -> bool:

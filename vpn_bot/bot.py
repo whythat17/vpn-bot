@@ -1,7 +1,9 @@
 # vpn_bot/bot.py
 import time
+from datetime import datetime, timezone
+import shutil
+from pathlib import Path
 import logging, os
-from datetime import datetime
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -10,14 +12,18 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from vpn_bot.config import BOT_TOKEN, PRICE_USDT, SUB_DAYS, DEV_MODE, OWNER_ID
+from vpn_bot.config import (
+    BOT_TOKEN, PRICE_USDT, SUB_DAYS, DEV_MODE, OWNER_ID,
+    SERVER_HOST, SERVER_PORT,
+    WG_ENDPOINT_HOST, WG_ENDPOINT_PORT, WG_ALLOWED_IPS, WG_DNS, WG_SERVER_PUBLIC_KEY,
+    WG_ADDRESS_PREFIX, WG_ADDRESS_CIDR, WG_START_HOST,
+)
 from vpn_bot.cryptopay import create_invoice, get_invoice_status
 from vpn_bot.users import (
-    load_users,
-    register_user,
-    activate_subscription,
-    is_subscription_active,
+    load_users, register_user, activate_subscription, is_subscription_active, save_users,
+    set_wg_profile, next_wg_address,
 )
+from vpn_bot.wg_utils import gen_wg_keypair
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -27,6 +33,18 @@ log = logging.getLogger("vpn_bot")
 
 # Загружаем пользователей при старте
 USERS = load_users()
+
+# Пути к шаблонам и личным конфигам
+CFG_DIR = Path(__file__).with_name("vpn_configs")
+TEMPLATE_OVPN = CFG_DIR / "default.ovpn"
+USER_CFG_DIR = CFG_DIR / "users"
+USER_CFG_DIR.mkdir(parents=True, exist_ok=True)
+
+TEMPLATE_WG = CFG_DIR / "default_wg.conf"
+USER_WG_DIR = CFG_DIR / "users"
+USER_WG_DIR.mkdir(parents=True, exist_ok=True)
+
+
 
 # Простейший анти-спам: кулдаун 2 сек на пользователя
 LAST_CALL: dict[int, float] = {}
@@ -44,6 +62,83 @@ async def _throttle(update: Update) -> bool:
         return True
     LAST_CALL[uid] = now
     return False
+
+def ensure_user_config(user_id: int) -> Path:
+    """
+    Гарантирует, что у пользователя есть свой файл-конфиг.
+    Если нет — рендерим из шаблона default.ovpn, подставляя плейсхолдеры.
+    Возвращает путь к файлу.
+    """
+    dst = USER_CFG_DIR / f"{user_id}.ovpn"
+    if dst.exists():
+        return dst
+
+    if not TEMPLATE_OVPN.exists():
+        raise FileNotFoundError("Шаблон default.ovpn не найден в vpn_bot/vpn_configs/")
+
+    # берём дату окончания подписки пользователя (если есть)
+    u = USERS.get(user_id)
+    sub_end = getattr(u, "subscription_end", None) or ""
+
+    # читаем шаблон и подставляем значения
+    text = TEMPLATE_OVPN.read_text(encoding="utf-8")
+    placeholders = {
+        "SERVER_HOST": SERVER_HOST,
+        "SERVER_PORT": str(SERVER_PORT),
+        "USER_ID": str(user_id),
+        "SUB_END": sub_end,
+    }
+    for k, v in placeholders.items():
+        text = text.replace(f"{{{{{k}}}}}", v)
+
+    dst.write_text(text, encoding="utf-8")
+    return dst
+
+def ensure_user_wg_config(user_id: int) -> Path:
+    """
+    Для пользователя гарантирует наличие wg-ключей + адреса, рендерит .conf из шаблона.
+    """
+    dst = USER_WG_DIR / f"{user_id}.conf"
+    # если файл уже есть, просто возвращаем
+    if dst.exists():
+        return dst
+    if not TEMPLATE_WG.exists():
+        raise FileNotFoundError("Шаблон default_wg.conf не найден в vpn_bot/vpn_configs/")
+
+    # получаем/генерируем профиль
+    u = USERS.setdefault(user_id, None)
+    need_save = False
+    if not u or not getattr(u, "wg_private_key", None) or not getattr(u, "wg_public_key", None):
+        priv, pub = gen_wg_keypair()
+        addr = next_wg_address(USERS, WG_ADDRESS_PREFIX, WG_ADDRESS_CIDR, start_host=WG_START_HOST)
+        set_wg_profile(USERS, user_id, priv, pub, addr)
+        need_save = True
+
+    # перечитываем (на случай, если только что создали)
+    u = USERS[user_id]
+    sub_end = getattr(u, "subscription_end", "") or ""
+
+    # готовим плейсхолдеры
+    placeholders = {
+        "USER_ID": str(user_id),
+        "SUB_END": sub_end,
+        "WG_ENDPOINT_HOST": WG_ENDPOINT_HOST,
+        "WG_ENDPOINT_PORT": str(WG_ENDPOINT_PORT),
+        "WG_ALLOWED_IPS": WG_ALLOWED_IPS,
+        "WG_DNS": WG_DNS,
+        "WG_SERVER_PUBLIC_KEY": WG_SERVER_PUBLIC_KEY,
+        "CLIENT_PRIVATE_KEY": u.wg_private_key or "<MISSING_PRIV>",
+        "CLIENT_ADDRESS": u.wg_address or "<MISSING_ADDR>",
+    }
+
+    text = TEMPLATE_WG.read_text(encoding="utf-8")
+    for k, v in placeholders.items():
+        text = text.replace(f"{{{{{k}}}}}", v)
+
+    dst.write_text(text, encoding="utf-8")
+    if need_save:
+        save_users(USERS)
+    return dst
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -116,6 +211,15 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if status == "paid":
         activate_subscription(USERS, user_id, days=SUB_DAYS)
+        try:
+            ensure_user_wg_config(user_id)
+        except Exception:
+            log.exception("WG profile prepare failed on activation")
+        try:
+            ensure_user_config(user_id)
+        except Exception as e:
+            log.exception("Не удалось создать персональный конфиг")
+        await update.message.reply_text("✅ Оплата получена! Подписка активирована.")
         await update.message.reply_text("✅ Оплата получена! Подписка активирована.")
     elif status == "active":
         await update.message.reply_text("🕓 Счёт пока не оплачен. Если оплатили только что — подождите минуту и повторите /check.")
@@ -130,19 +234,52 @@ async def vpn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _throttle(update): return
     user_id = update.effective_user.id
     if is_subscription_active(USERS, user_id):
-        cfg_dir = os.path.join(os.path.dirname(__file__), "vpn_configs")
-        file_path = os.path.join(cfg_dir, "default.ovpn")
-        if os.path.exists(file_path):
-            with open(file_path, "rb") as f:
+        try:
+            cfg_path = ensure_user_config(user_id)  # берём персональный
+        except FileNotFoundError:
+            await update.message.reply_text("⚠️ Не найден шаблон default.ovpn. Положи файл в vpn_bot/vpn_configs/default.ovpn")
+            return
+        except Exception as e:
+            log.exception("Ошибка при подготовке конфига")
+            await update.message.reply_text("⚠️ Не удалось подготовить конфиг. Попробуйте позже.")
+            return
+
+        if cfg_path.exists():
+            with cfg_path.open("rb") as f:
                 await update.message.reply_document(
                     document=f,
-                    filename="vpn.ovpn",
-                    caption="🔐 Ваш VPN-конфиг",
+                    filename=f"vpn_{user_id}.ovpn",
+                    caption="🔐 Ваш персональный VPN-конфиг",
                 )
         else:
-            await update.message.reply_text("⚠️ Конфиг не найден. Создайте файл vpn_bot/vpn_configs/default.ovpn")
+            await update.message.reply_text("⚠️ Конфиг не найден. Попробуйте снова или напишите в поддержку.")
     else:
         await update.message.reply_text("⛔ У вас нет активной подписки. Создайте счёт командой /buy.")
+
+async def vpn_wg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _throttle(update): return
+    user_id = update.effective_user.id
+    if not is_subscription_active(USERS, user_id):
+        await update.message.reply_text("⛔ Нет активной подписки. Сначала /buy и /check (или /dev_paid).")
+        return
+    try:
+        cfg_path = ensure_user_wg_config(user_id)
+    except FileNotFoundError:
+        await update.message.reply_text("⚠️ Не найден шаблон default_wg.conf. Положи его в vpn_bot/vpn_configs/")
+        return
+    except Exception:
+        log.exception("WG prepare error")
+        await update.message.reply_text("⚠️ Не удалось подготовить WG-конфиг. Попробуйте позже.")
+        return
+
+    with cfg_path.open("rb") as f:
+        await update.message.reply_document(
+            document=f,
+            filename=f"wg_{user_id}.conf",
+            caption="🔐 Ваш персональный WireGuard-конфиг (шаблон)",
+        )
+
+
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _throttle(update): return
@@ -189,6 +326,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/check <invoice_id> — проверить оплату (active/paid/expired)\n"
         "/status — показать статус подписки\n"
         "/vpn — получить VPN-конфиг (если подписка активна)\n\n"
+        "/vpn_wg — получить WireGuard-конфиг (шаблон)\n"
         "DEV (только для владельца, если DEV_MODE=true):\n"
         "/dev_paid <invoice_id> — имитация оплаты\n"
         "/grant <days> — выдать подписку на N дней"
@@ -210,6 +348,15 @@ async def dev_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование (dev): /dev_paid <invoice_id>")
         return
     activate_subscription(USERS, user_id, days=SUB_DAYS)
+    try:
+        ensure_user_wg_config(user_id)
+    except Exception:
+        log.exception("WG profile prepare failed on activation")
+    try:
+        ensure_user_config(user_id)
+    except Exception as e:
+        log.exception("Не удалось создать персональный конфиг (dev_paid)")
+    await update.message.reply_text("✅ (DEV) Оплата имитирована. Подписка активирована.")
     await update.message.reply_text("✅ (DEV) Оплата имитирована. Подписка активирована.")
 
 async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -220,6 +367,15 @@ async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = int(args[0]) if args else SUB_DAYS
     user_id = update.effective_user.id
     activate_subscription(USERS, user_id, days=days)
+    try:
+        ensure_user_wg_config(user_id)
+    except Exception:
+        log.exception("WG profile prepare failed on activation")
+    try:
+        ensure_user_config(user_id)
+    except Exception as e:
+        log.exception("Не удалось создать персональный конфиг (grant)")
+    await update.message.reply_text(f"🎁 (DEV) Подписка выдана на {days} дн.")
     await update.message.reply_text(f"🎁 (DEV) Подписка выдана на {days} дн.")
 
 from telegram.error import TelegramError
@@ -233,28 +389,86 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         pass
 
+async def check_subscriptions(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Периодически проверяет users.json и отключает истёкшие подписки.
+    Отправляет пользователю уведомление об окончании.
+    """
+    now = datetime.now(timezone.utc)
+    changed = False
+    expired_count = 0
+
+    # USERS — глобальный dict[int, User]
+    for uid, u in list(USERS.items()):
+        end_iso = getattr(u, "subscription_end", None)
+        if not end_iso:
+            continue
+        try:
+            end = datetime.fromisoformat(end_iso)
+        except Exception:
+            continue
+
+        # если подписка была активна и срок вышел
+        if getattr(u, "subscribed", False) and now >= end:
+            u.subscribed = False
+            changed = True
+            expired_count += 1
+            # пробуем уведомить пользователя; игнорируем любые ошибки отправки
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text="⛔ Ваша подписка истекла. Чтобы продлить, используйте /buy."
+                )
+            except Exception:
+                pass
+
+    if changed:
+        save_users(USERS)
+        log.info(f"[job] auto-expired {expired_count} subscriptions")
+
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_error_handler(on_error)
 
+    # основные команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("check", check))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("vpn_wg", vpn_wg))
     app.add_handler(CommandHandler("vpn", vpn))
+    app.add_handler(CommandHandler("help", help_cmd))
 
-    # DEV handlers
+    # DEV команды
     if DEV_MODE:
         app.add_handler(CommandHandler("dev_paid", dev_paid))
         app.add_handler(CommandHandler("grant", grant))
 
+        # быстрая проверка подписок в DEV-режиме
+        async def dev_checksubs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if update.effective_user.id != OWNER_ID:
+                return
+            await check_subscriptions(context)
+            await update.message.reply_text("🔧 (DEV) Проверка подписок выполнена.")
+
+        app.add_handler(CommandHandler("dev_checksubs", dev_checksubs))
+
+    # unknown — СТРОГО ПОСЛЕДНИМ!
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
+
+    # планировщик: проверка подписок раз в час, первая через 60 секунд
+    app.job_queue.run_repeating(
+        check_subscriptions,
+        interval=3600,
+        first=60,
+        name="sub_checker",
+    )
 
     log.info("Бот запущен")
     app.run_polling()
+
 
 
 if __name__ == "__main__":
